@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import sys
 from dataclasses import dataclass, asdict
 from typing import Any, Optional
 from urllib.parse import urlparse, quote
@@ -21,7 +23,69 @@ from urllib.parse import urlparse, quote
 from fingerprint import Fingerprint, generate_fingerprint
 from geo import GeoProfile, detect_geo, default_geo
 
-PROFILES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiles")
+
+def _data_dir() -> str:
+    """
+    Каталог данных приложения — ВНЕ папки с исходниками.
+
+    Данные профилей лочатся Chromium и пухнут; держать их в репозитории — это и
+    git-мусор, и проблемы с удалением/блокировками. Кладём в пользовательский
+    каталог ОС (можно переопределить переменной ANTIDETECT_DATA_DIR).
+    """
+    override = os.environ.get("ANTIDETECT_DATA_DIR")
+    if override:
+        return override
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(base, "antidetect")
+
+
+DATA_DIR = _data_dir()
+PROFILES_DIR = os.path.join(DATA_DIR, "profiles")
+# Старое расположение (внутри проекта) — для одноразовой миграции.
+_LEGACY_PROFILES_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "profiles")
+
+
+def _migrate_legacy_profiles() -> None:
+    """
+    Один раз перенести профили из старой папки проекта в DATA_DIR.
+
+    Переносим АТОМАРНО (os.rename), без копирования — чтобы не плодить частичные
+    дубликаты, если какой-то файл залочен (напр. last_run.log открыт в IDE).
+    Если профиль уже есть в новом месте — старую копию просто чистим.
+    """
+    if os.path.abspath(_LEGACY_PROFILES_DIR) == os.path.abspath(PROFILES_DIR):
+        return
+    if not os.path.isdir(_LEGACY_PROFILES_DIR):
+        return
+    os.makedirs(PROFILES_DIR, exist_ok=True)
+    for name in os.listdir(_LEGACY_PROFILES_DIR):
+        src = os.path.join(_LEGACY_PROFILES_DIR, name)
+        dst = os.path.join(PROFILES_DIR, name)
+        if not os.path.isdir(src):
+            continue
+        if os.path.exists(os.path.join(dst, "profile.json")):
+            shutil.rmtree(src, ignore_errors=True)  # уже перенесён — чистим старое
+            continue
+        if os.path.exists(os.path.join(src, "profile.json")):
+            try:
+                os.rename(src, dst)         # атомарный перенос, без частичных копий
+            except OSError:
+                pass                        # залочен -> оставим, перенесётся позже
+        else:
+            shutil.rmtree(src, ignore_errors=True)  # битый каталог без профиля — мусор
+    try:
+        os.rmdir(_LEGACY_PROFILES_DIR)      # уберём, если опустела
+    except OSError:
+        pass
+
+
+_migrate_legacy_profiles()
 
 
 @dataclass
@@ -146,9 +210,47 @@ def create_profile(name: str, proxy_raw: Optional[str]) -> Profile:
             print("[!] SOCKS5 с логином/паролем Chromium НЕ поддерживает напрямую — "
                   "гео определю, но в браузере нужен локальный мост (см. README).")
         geo = detect_geo(proxy.url())
+        if geo is None:
+            # НЕ создаём профиль с дефолтным US на не-US прокси — это рассинхрон
+            # таймзоны/языка с IP и прямой повод для детекта. Лучше честно упасть.
+            raise RuntimeError(
+                "Не удалось определить гео по прокси (прокси недоступен или медленный). "
+                "Профиль НЕ создан, чтобы таймзона/язык не разошлись с IP. "
+                "Проверьте прокси и повторите.")
     geo = geo or default_geo()
 
     profile = Profile(name=name, fingerprint=fingerprint, geo=geo, proxy=proxy)
     profile.save()
     print(f"[+] Профиль {name!r} создан в {profile.dir}")
+    return profile
+
+
+def set_profile_proxy(name: str, proxy_raw: Optional[str]) -> Profile:
+    """
+    Сменить прокси у существующего профиля и пере-определить гео по нему.
+
+    Отпечаток (fingerprint) остаётся прежним — это «личность» профиля.
+    А таймзону/язык переопределяем по новому IP, чтобы IP и гео не рассинхронились
+    (рассинхрон — классический признак для детекта).
+    """
+    profile = Profile.load(name)
+    proxy = ProxyConfig.parse(proxy_raw) if proxy_raw else None
+
+    geo = None
+    if proxy:
+        if proxy.is_authed_socks():
+            print("[!] SOCKS5 с логином/паролем Chromium НЕ поддерживает напрямую — "
+                  "гео определю, но в браузере нужен локальный мост (см. README).")
+        geo = detect_geo(proxy.url())
+        if geo is None:
+            raise RuntimeError(
+                "Не удалось определить гео по новому прокси (недоступен/медленный). "
+                "Прокси НЕ изменён, чтобы таймзона/язык не разошлись с IP. "
+                "Проверьте прокси и повторите.")
+    geo = geo or default_geo()
+
+    profile.proxy = proxy
+    profile.geo = geo
+    profile.save()
+    print(f"[~] У профиля {name!r} обновлён прокси (гео: {geo.country}, tz={geo.timezone_id})")
     return profile

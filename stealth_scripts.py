@@ -30,21 +30,36 @@ def build_init_script(fp: Fingerprint, geo: GeoProfile) -> str:
     return (x % 3) - 1;
   }}
   const clamp = (v) => v < 0 ? 0 : (v > 255 ? 255 : v);
+  // seed-детерминированный индекс в [0,max). Нужен, чтобы трогать ОГРАНИЧЕННОЕ
+  // число пикселей (а не миллионы) — иначе на тяжёлых холстах (Telegram/CreepJS/
+  // YouTube) хук вешает главный поток и страница белеет.
+  function sIndex(k, max) {{
+    let x = (SEED ^ ((k + 1) * 2246822519)) >>> 0;
+    x ^= x << 13; x >>>= 0;
+    x ^= x >> 17;
+    x ^= x << 5;  x >>>= 0;
+    return x % max;
+  }}
+  const NOISE_PX = 48;   // сколько пикселей подкрашиваем — фиксировано, O(1) по нагрузке
 
-  // ---- Canvas 2D: лёгкий стабильный шум --------------------------------
+  // ---- Canvas 2D: стабильный шум ОГРАНИЧЕННОГО объёма ------------------
   try {{
     const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+    const tweak = (d) => {{
+      const px = d.length >> 2;
+      if (!px) return;
+      const N = px < NOISE_PX ? px : NOISE_PX;
+      for (let k = 0; k < N; k++) {{
+        const i = sIndex(k, px) << 2;
+        const n = (sIndex(k + 911, 3)) - 1;       // -1|0|1, детерминированно
+        d[i]   = clamp(d[i]   + n);
+        d[i+1] = clamp(d[i+1] + n);
+        d[i+2] = clamp(d[i+2] + n);
+      }}
+    }};
     CanvasRenderingContext2D.prototype.getImageData = function(...args) {{
       const img = origGetImageData.apply(this, args);
-      const d = img.data;
-      for (let i = 0; i < d.length; i += 4) {{
-        const n = noiseAt(i);
-        if (n !== 0) {{
-          d[i]   = clamp(d[i]   + n);
-          d[i+1] = clamp(d[i+1] + n);
-          d[i+2] = clamp(d[i+2] + n);
-        }}
-      }}
+      tweak(img.data);              // трогаем максимум NOISE_PX пикселей
       return img;
     }};
 
@@ -53,7 +68,11 @@ def build_init_script(fp: Fingerprint, geo: GeoProfile) -> str:
       try {{
         const ctx = this.getContext('2d');
         if (ctx && this.width && this.height) {{
-          const d = ctx.getImageData(0, 0, this.width, this.height); // уже с шумом
+          // подкрашиваем лишь маленький угол (а не весь холст) -> O(1)
+          const w = this.width  < 8 ? this.width  : 8;
+          const h = this.height < 8 ? this.height : 8;
+          const d = origGetImageData.call(ctx, 0, 0, w, h);
+          tweak(d.data);
           ctx.putImageData(d, 0, 0);
         }}
       }} catch (e) {{}}
@@ -61,7 +80,7 @@ def build_init_script(fp: Fingerprint, geo: GeoProfile) -> str:
     }};
   }} catch (e) {{}}
 
-  // ---- WebGL: подмена vendor/renderer + шум readPixels -----------------
+  // ---- WebGL: подмена vendor/renderer + ОГРАНИЧЕННЫЙ шум readPixels -----
   try {{
     const VENDOR = {fp.webgl_vendor!r};
     const RENDERER = {fp.webgl_renderer!r};
@@ -77,9 +96,11 @@ def build_init_script(fp: Fingerprint, geo: GeoProfile) -> str:
       proto.readPixels = function(x, y, w, h, fmt, type, pixels) {{
         origReadPixels.call(this, x, y, w, h, fmt, type, pixels);
         if (pixels && pixels.length) {{
-          for (let i = 0; i < pixels.length; i += 17) {{   // редкий стабильный шум
-            const n = noiseAt(i);
-            if (typeof pixels[i] === 'number') pixels[i] = clamp(pixels[i] + n);
+          const len = pixels.length;
+          const N = len < NOISE_PX ? len : NOISE_PX;   // максимум NOISE_PX элементов
+          for (let k = 0; k < N; k++) {{
+            const i = sIndex(k + 313, len);
+            if (typeof pixels[i] === 'number') pixels[i] = clamp(pixels[i] + (sIndex(k, 3) - 1));
           }}
         }}
       }};

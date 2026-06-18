@@ -34,13 +34,29 @@ class GeoProfile:
     accept_language: str      # напр. "en-US,en;q=0.9"
     languages: list[str]      # navigator.languages, напр. ["en-US", "en"]
     country: str              # ISO2, напр. "US"
+    city: str = ""            # город точки выхода прокси, напр. "New York"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "GeoProfile":
-        return cls(**d)
+        # игнорируем лишние ключи на случай миграций схемы (city добавлен позже)
+        known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
+        return cls(**{k: v for k, v in d.items() if k in known})
+
+
+def country_flag(code: str) -> str:
+    """
+    ISO2-код страны -> эмодзи-флаг ('US' -> '🇺🇸').
+
+    Собирается из двух regional-indicator символов. На системах без флаг-шрифта
+    (напр. обычный Windows) покажется как две буквы кода — это нормально.
+    """
+    code = (code or "").strip().upper()
+    if len(code) != 2 or not code.isalpha():
+        return ""
+    return chr(0x1F1E6 + ord(code[0]) - ord("A")) + chr(0x1F1E6 + ord(code[1]) - ord("A"))
 
 
 def _build_languages(locale: str) -> tuple[str, list[str]]:
@@ -51,25 +67,37 @@ def _build_languages(locale: str) -> tuple[str, list[str]]:
     return ",".join(parts), langs
 
 
-def detect_geo(proxy_url: Optional[str], timeout: int = 15) -> Optional[GeoProfile]:
+def detect_geo(proxy_url: Optional[str], timeout: int = 15,
+               attempts: int = 3) -> Optional[GeoProfile]:
     """
     Вернуть GeoProfile по выходному IP прокси, либо None если не удалось.
     proxy_url: полная строка вида 'http://user:pass@host:port' или
                'socks5://user:pass@host:port'. None -> прямое соединение.
+
+    Делаем несколько попыток: резидентные прокси часто тайм-аутят разово, а
+    тихий откат на дефолтную таймзону/язык = рассинхрон с IP = детект. Лучше
+    переспросить, чем поставить US наугад.
     """
     proxies = None
     if proxy_url:
         proxies = {"http": proxy_url, "https": proxy_url}
 
-    try:
-        # ip-api.com: бесплатно, без ключа, отдаёт timezone и countryCode.
-        r = requests.get(
-            "http://ip-api.com/json/?fields=status,countryCode,timezone,query",
-            proxies=proxies, timeout=timeout,
-        )
-        data = r.json()
-    except Exception as e:  # noqa: BLE001
-        print(f"[geo] не удалось определить гео по прокси: {e}")
+    data = None
+    for i in range(max(1, attempts)):
+        try:
+            # ip-api.com: бесплатно, без ключа, отдаёт timezone, countryCode и city.
+            r = requests.get(
+                "http://ip-api.com/json/?fields=status,countryCode,city,timezone,query",
+                proxies=proxies, timeout=timeout,
+            )
+            data = r.json()
+            break
+        except Exception as e:  # noqa: BLE001
+            print(f"[geo] попытка {i + 1}/{attempts} не удалась: {e}")
+            data = None
+
+    if data is None:
+        print("[geo] не удалось определить гео по прокси (все попытки).")
         return None
 
     if data.get("status") != "success":
@@ -77,11 +105,12 @@ def detect_geo(proxy_url: Optional[str], timeout: int = 15) -> Optional[GeoProfi
         return None
 
     country = data.get("countryCode", "US")
+    city = data.get("city", "")
     tz = data.get("timezone", "UTC")
     locale = _COUNTRY_LOCALE.get(country, "en-US")
     accept_language, languages = _build_languages(locale)
 
-    print(f"[geo] прокси выходит из {country} ({data.get('query')}), "
+    print(f"[geo] прокси выходит из {country}/{city} ({data.get('query')}), "
           f"tz={tz}, locale={locale}")
     return GeoProfile(
         timezone_id=tz,
@@ -89,6 +118,7 @@ def detect_geo(proxy_url: Optional[str], timeout: int = 15) -> Optional[GeoProfi
         accept_language=accept_language,
         languages=languages,
         country=country,
+        city=city,
     )
 
 
@@ -101,4 +131,5 @@ def default_geo() -> GeoProfile:
         accept_language=accept_language,
         languages=languages,
         country="US",
+        city="New York",
     )
